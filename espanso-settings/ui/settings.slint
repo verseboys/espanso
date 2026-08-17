@@ -1,9 +1,11 @@
-import { Button, LineEdit, TextEdit, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit, TextEdit, VerticalBox, HorizontalBox, ScrollView, ComboBox } from "std-widgets.slint";
 
 export struct MatchRow {
     id: string,
+    title: string,
     trigger: string,
     preview: string,
+    category: string,
     // Empty for matches Settings owns; the file path for everything else.
     source-path: string,
     source-label: string,
@@ -40,9 +42,17 @@ export component SettingsWindow inherits Window {
     in-out property <bool> undo-visible: false;
     in-out property <string> selected-id;
     in-out property <string> filter-text;
+    in-out property <string> short-name-text;
     in-out property <string> trigger-text;
     in-out property <string> replacement-text;
+    in-out property <string> description-text;
+    in-out property <string> category-id;
+    in-out property <string> new-category-text;
     in property <[MatchRow]> match-rows;
+    in property <[string]> category-names;
+    in property <[string]> category-filter-names;
+    in-out property <int> category-filter-index: 0;
+    in-out property <int> editor-category-index: 0;
 
     callback request-tab-switch(int);
     callback confirm-discard();
@@ -68,6 +78,9 @@ export component SettingsWindow inherits Window {
     callback undo-delete();
     callback commit-deletion();
     callback apply-filter(string);
+    callback apply-category-filter(int);
+    callback editor-category-changed(int);
+    callback add-category();
 
     VerticalBox {
         padding: 18px;
@@ -257,10 +270,19 @@ export component SettingsWindow inherits Window {
                     HorizontalBox {
                         LineEdit {
                             text <=> root.filter-text;
-                            placeholder-text: "Search triggers or replacement text";
+                            placeholder-text: "Search name, trigger, text, notes";
                             horizontal-stretch: 1;
                         }
                         Button { text: "Search"; clicked => { root.apply-filter(root.filter-text); } }
+                    }
+                    HorizontalBox {
+                        Text { text: "Category"; color: #526078; vertical-alignment: center; }
+                        ComboBox {
+                            model: root.category-filter-names;
+                            current-index <=> root.category-filter-index;
+                            horizontal-stretch: 1;
+                            selected => { root.apply-category-filter(root.category-filter-index); }
+                        }
                     }
                     Button { text: "New match"; clicked => { root.new-match(); } }
                     ScrollView {
@@ -268,15 +290,25 @@ export component SettingsWindow inherits Window {
                         VerticalBox {
                             spacing: 6px;
                             for row in root.match-rows: Rectangle {
-                                min-height: 58px;
+                                min-height: 64px;
                                 background: row.editable ? #f8f9fc : #f2f4f8;
                                 border-radius: 5px;
                                 HorizontalBox {
                                     padding: 8px;
                                     VerticalBox {
                                         horizontal-stretch: 1;
-                                        Text { text: row.trigger; font-weight: 600; color: #172033; }
-                                        Text { text: row.preview; color: #69758a; overflow: elide; }
+                                        Text { text: row.title; font-weight: 600; color: #172033; overflow: elide; }
+                                        Text {
+                                            text: row.trigger == "" ? row.preview : (row.trigger + "  ·  " + row.preview);
+                                            color: #69758a;
+                                            overflow: elide;
+                                        }
+                                        if row.category != "": Text {
+                                            text: row.category;
+                                            color: #3b5bdb;
+                                            font-size: 12px;
+                                            overflow: elide;
+                                        }
                                         if !row.editable: Text {
                                             text: row.source-label + " · " + row.note;
                                             color: #8a6a1f;
@@ -303,6 +335,12 @@ export component SettingsWindow inherits Window {
                     padding: 16px;
                     spacing: 8px;
                     Text { text: root.selected-id == "" ? "New match" : "Edit match"; font-size: 20px; font-weight: 600; }
+                    Text { text: "Short name"; color: #526078; }
+                    LineEdit {
+                        text <=> root.short-name-text;
+                        placeholder-text: "e.g. Ticket signature";
+                        edited => { root.draft-changed(); }
+                    }
                     Text { text: "Trigger text"; color: #526078; }
                     LineEdit {
                         text <=> root.trigger-text;
@@ -314,6 +352,27 @@ export component SettingsWindow inherits Window {
                         text <=> root.replacement-text;
                         vertical-stretch: 1;
                         edited => { root.draft-changed(); }
+                    }
+                    Text { text: "Description"; color: #526078; }
+                    TextEdit {
+                        text <=> root.description-text;
+                        min-height: 64px;
+                        edited => { root.draft-changed(); }
+                    }
+                    Text { text: "Category"; color: #526078; }
+                    ComboBox {
+                        model: root.category-names;
+                        current-index <=> root.editor-category-index;
+                        selected => { root.editor-category-changed(root.editor-category-index); }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        LineEdit {
+                            text <=> root.new-category-text;
+                            placeholder-text: "New category name";
+                            horizontal-stretch: 1;
+                        }
+                        Button { text: "Add category"; clicked => { root.add-category(); } }
                     }
                     HorizontalBox {
                         Text { text: "Supports multiple lines, emoji and CJK characters"; color: #69758a; horizontal-stretch: 1; }

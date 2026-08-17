@@ -9,10 +9,10 @@ use anyhow::{Context, Result};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::{
-    scan_external_matches, AdoptPlan, AdoptService, BackupService, ConfigLocationStore,
-    EspansoConfigValidator, ImportPlan, MatchRepository, MigrationService, ModelEffect,
-    ModelMessage, ScaffoldService, SettingsLaunchOptions, SettingsModel, SettingsTab, UiMatch,
-    UiMatchRepository,
+    scan_external_matches, AdoptPlan, AdoptService, BackupService, CategoryFilter,
+    ConfigLocationStore, EspansoConfigValidator, ImportPlan, MatchRepository, MigrationService,
+    ModelEffect, ModelMessage, ScaffoldService, SettingsLaunchOptions, SettingsModel, SettingsTab,
+    UiMatch, UiMatchRepository,
 };
 
 pub fn run(options: SettingsLaunchOptions) -> Result<()> {
@@ -60,19 +60,21 @@ fn reload_matches(
     repository: &Rc<RefCell<UiMatchRepository>>,
     config_root: &Path,
 ) {
-    let (matches, load_error) = match repository.borrow().load() {
-        Ok(matches) => (matches, None),
-        Err(error) => (Vec::new(), Some(error)),
+    let (loaded, load_error) = match repository.borrow().load() {
+        Ok(loaded) => (loaded, None),
+        Err(error) => ((Vec::new(), Vec::new()), Some(error)),
     };
     let owned_path = repository.borrow().path().to_path_buf();
     {
         let mut model = model.borrow_mut();
-        model.set_matches(matches);
+        model.set_matches(loaded.0);
+        model.set_categories(loaded.1);
         model.set_external(scan_external_matches(config_root, &owned_path));
     }
     if let Some(error) = load_error {
         window.set_error_message(format!("Cannot load matches; file unchanged: {error}").into());
     }
+    refresh_category_models(window, &model.borrow());
     refresh_rows(window, &model.borrow());
 }
 
@@ -136,16 +138,14 @@ fn bind_match_editor(
     let weak = window.as_weak();
     let select_model = Rc::clone(&model);
     window.on_select_match(move |id| {
-        let selected = select_model
-            .borrow()
+        let model = select_model.borrow();
+        let selected = model
             .matches()
             .iter()
             .find(|item| item.id == id.as_str())
             .cloned();
         if let (Some(window), Some(selected)) = (weak.upgrade(), selected) {
-            window.set_selected_id(selected.id.into());
-            window.set_trigger_text(selected.trigger.into());
-            window.set_replacement_text(selected.replace.into());
+            fill_editor(&window, &model, &selected);
             window.set_status_message("Match loaded; edit it and save".into());
         }
     });
@@ -153,9 +153,7 @@ fn bind_match_editor(
     let weak = window.as_weak();
     window.on_new_match(move || {
         if let Some(window) = weak.upgrade() {
-            window.set_selected_id(SharedString::default());
-            window.set_trigger_text(SharedString::default());
-            window.set_replacement_text(SharedString::default());
+            clear_editor(&window);
             window.set_status_message("Creating a new match".into());
         }
     });
@@ -171,10 +169,15 @@ fn bind_match_editor(
         if id.is_empty() {
             id = next_match_id();
         }
+        let category_id =
+            category_id_from_editor_index(&save_model.borrow(), window.get_editor_category_index());
         let candidate = UiMatch {
             id: id.clone(),
             trigger: window.get_trigger_text().to_string(),
             replace: window.get_replacement_text().to_string(),
+            short_name: window.get_short_name_text().to_string(),
+            description: window.get_description_text().to_string(),
+            category_id,
         };
         let mut matches = save_model.borrow().matches().to_vec();
         if let Some(existing) = matches.iter_mut().find(|item| item.id == id) {
@@ -182,14 +185,16 @@ fn bind_match_editor(
         } else {
             matches.push(candidate);
         }
+        let categories = save_model.borrow().categories().to_vec();
 
-        match save_repository.borrow().save(&matches) {
+        match save_repository.borrow().save(&matches, &categories) {
             Ok(()) => {
                 save_model.borrow_mut().set_matches(matches);
                 save_model.borrow_mut().reduce(ModelMessage::Saved);
                 window.set_selected_id(id.into());
                 window.set_error_message(SharedString::default());
                 window.set_status_message("Match saved; Espanso will reload automatically".into());
+                refresh_category_models(&window, &save_model.borrow());
                 refresh_rows(&window, &save_model.borrow());
             }
             Err(error) => {
@@ -206,9 +211,7 @@ fn bind_match_editor(
             .reduce(ModelMessage::Delete(id.to_string()));
         if let Some(window) = weak.upgrade() {
             if effect == ModelEffect::MatchesChanged {
-                window.set_selected_id(SharedString::default());
-                window.set_trigger_text(SharedString::default());
-                window.set_replacement_text(SharedString::default());
+                clear_editor(&window);
                 window.set_undo_visible(true);
                 window.set_status_message("Match removed; you can undo before saving".into());
                 refresh_rows(&window, &delete_model.borrow());
@@ -236,9 +239,9 @@ fn bind_match_editor(
         let Some(window) = weak.upgrade() else {
             return;
         };
-        let outcome = commit_repository
-            .borrow()
-            .save(commit_model.borrow().matches());
+        let matches = commit_model.borrow().matches().to_vec();
+        let categories = commit_model.borrow().categories().to_vec();
+        let outcome = commit_repository.borrow().save(&matches, &categories);
         match outcome {
             Ok(()) => {
                 commit_model.borrow_mut().reduce(ModelMessage::Saved);
@@ -267,6 +270,68 @@ fn bind_match_editor(
             .reduce(ModelMessage::FilterChanged(filter.to_string()));
         if let Some(window) = weak.upgrade() {
             refresh_rows(&window, &filter_model.borrow());
+        }
+    });
+
+    let weak = window.as_weak();
+    let category_filter_model = Rc::clone(&model);
+    window.on_apply_category_filter(move |index| {
+        let filter = category_filter_from_index(&category_filter_model.borrow(), index);
+        category_filter_model
+            .borrow_mut()
+            .reduce(ModelMessage::CategoryFilterChanged(filter));
+        if let Some(window) = weak.upgrade() {
+            refresh_rows(&window, &category_filter_model.borrow());
+        }
+    });
+
+    let weak = window.as_weak();
+    let editor_category_model = Rc::clone(&model);
+    window.on_editor_category_changed(move |index| {
+        if let Some(window) = weak.upgrade() {
+            let category_id = category_id_from_editor_index(&editor_category_model.borrow(), index);
+            window.set_category_id(category_id.into());
+            editor_category_model
+                .borrow_mut()
+                .reduce(ModelMessage::DraftChanged);
+        }
+    });
+
+    let weak = window.as_weak();
+    let add_category_model = Rc::clone(&model);
+    let add_category_repository = Rc::clone(&repository);
+    window.on_add_category(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let name = window.get_new_category_text().to_string();
+        match add_category_model.borrow_mut().add_category(&name) {
+            Ok(category) => {
+                // Persist the category directory immediately so it survives even
+                // if the user never saves the current draft match.
+                let matches = add_category_model.borrow().matches().to_vec();
+                let categories = add_category_model.borrow().categories().to_vec();
+                if let Err(error) = add_category_repository.borrow().save(&matches, &categories) {
+                    window.set_error_message(error.to_string().into());
+                    return;
+                }
+                add_category_model.borrow_mut().reduce(ModelMessage::Saved);
+                window.set_new_category_text(SharedString::default());
+                window.set_category_id(category.id.clone().into());
+                refresh_category_models(&window, &add_category_model.borrow());
+                // Select the new category in the editor combo (index 0 is Uncategorized).
+                let index = add_category_model
+                    .borrow()
+                    .categories()
+                    .iter()
+                    .position(|item| item.id == category.id)
+                    .map_or(0, |position| (position + 1) as i32);
+                window.set_editor_category_index(index);
+                window.set_error_message(SharedString::default());
+                window.set_status_message(format!("Category “{}” added", category.name).into());
+                refresh_rows(&window, &add_category_model.borrow());
+            }
+            Err(error) => window.set_error_message(error.to_string().into()),
         }
     });
 }
@@ -634,14 +699,31 @@ fn refresh_rows(window: &crate::SettingsWindow, model: &SettingsModel) {
     let mut rows = model
         .filtered_matches()
         .into_iter()
-        .map(|item| crate::MatchRow {
-            id: item.id.clone().into(),
-            trigger: item.trigger.clone().into(),
-            preview: item.replace.lines().next().unwrap_or_default().into(),
-            source_path: SharedString::default(),
-            source_label: SharedString::default(),
-            note: SharedString::default(),
-            editable: true,
+        .map(|item| {
+            let title = if item.short_name.trim().is_empty() {
+                item.trigger.clone()
+            } else {
+                item.short_name.clone()
+            };
+            let trigger_line = if item.short_name.trim().is_empty() {
+                String::new()
+            } else {
+                item.trigger.clone()
+            };
+            crate::MatchRow {
+                id: item.id.clone().into(),
+                title: title.into(),
+                trigger: trigger_line.into(),
+                preview: item.replace.lines().next().unwrap_or_default().into(),
+                category: model
+                    .category_name(&item.category_id)
+                    .unwrap_or_default()
+                    .into(),
+                source_path: SharedString::default(),
+                source_label: SharedString::default(),
+                note: SharedString::default(),
+                editable: true,
+            }
         })
         .collect::<Vec<_>>();
     // Editable entries first: those are the ones the user can act on here,
@@ -652,8 +734,10 @@ fn refresh_rows(window: &crate::SettingsWindow, model: &SettingsModel) {
             .into_iter()
             .map(|item| crate::MatchRow {
                 id: SharedString::default(),
-                trigger: item.trigger.clone().into(),
+                title: item.trigger.clone().into(),
+                trigger: SharedString::default(),
                 preview: item.preview.clone().into(),
+                category: SharedString::default(),
                 source_path: path_text(&item.source),
                 source_label: item.source_label.clone().into(),
                 note: item.note.clone().into(),
@@ -661,6 +745,96 @@ fn refresh_rows(window: &crate::SettingsWindow, model: &SettingsModel) {
             }),
     );
     window.set_match_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
+fn refresh_category_models(window: &crate::SettingsWindow, model: &SettingsModel) {
+    let mut editor_names = vec![SharedString::from("Uncategorized")];
+    editor_names.extend(
+        model
+            .categories()
+            .iter()
+            .map(|item| SharedString::from(item.name.as_str())),
+    );
+    window.set_category_names(ModelRc::from(Rc::new(VecModel::from(editor_names))));
+
+    let mut filter_names = vec![
+        SharedString::from("All categories"),
+        SharedString::from("Uncategorized"),
+    ];
+    filter_names.extend(
+        model
+            .categories()
+            .iter()
+            .map(|item| SharedString::from(item.name.as_str())),
+    );
+    window.set_category_filter_names(ModelRc::from(Rc::new(VecModel::from(filter_names))));
+
+    // Keep the filter combo index aligned with the current model filter.
+    let filter_index = match model.category_filter() {
+        CategoryFilter::All => 0,
+        CategoryFilter::Uncategorized => 1,
+        CategoryFilter::Id(id) => model
+            .categories()
+            .iter()
+            .position(|item| item.id == *id)
+            .map_or(0, |position| (position + 2) as i32),
+    };
+    window.set_category_filter_index(filter_index);
+}
+
+fn fill_editor(window: &crate::SettingsWindow, model: &SettingsModel, selected: &UiMatch) {
+    window.set_selected_id(selected.id.clone().into());
+    window.set_short_name_text(selected.short_name.clone().into());
+    window.set_trigger_text(selected.trigger.clone().into());
+    window.set_replacement_text(selected.replace.clone().into());
+    window.set_description_text(selected.description.clone().into());
+    window.set_category_id(selected.category_id.clone().into());
+    window.set_editor_category_index(editor_index_for_category(model, &selected.category_id));
+}
+
+fn clear_editor(window: &crate::SettingsWindow) {
+    window.set_selected_id(SharedString::default());
+    window.set_short_name_text(SharedString::default());
+    window.set_trigger_text(SharedString::default());
+    window.set_replacement_text(SharedString::default());
+    window.set_description_text(SharedString::default());
+    window.set_category_id(SharedString::default());
+    window.set_editor_category_index(0);
+}
+
+fn category_id_from_editor_index(model: &SettingsModel, index: i32) -> String {
+    if index <= 0 {
+        return String::new();
+    }
+    model
+        .categories()
+        .get((index as usize).saturating_sub(1))
+        .map(|item| item.id.clone())
+        .unwrap_or_default()
+}
+
+fn editor_index_for_category(model: &SettingsModel, category_id: &str) -> i32 {
+    let id = category_id.trim();
+    if id.is_empty() {
+        return 0;
+    }
+    model
+        .categories()
+        .iter()
+        .position(|item| item.id == id)
+        .map_or(0, |position| (position + 1) as i32)
+}
+
+fn category_filter_from_index(model: &SettingsModel, index: i32) -> CategoryFilter {
+    match index {
+        i if i <= 0 => CategoryFilter::All,
+        1 => CategoryFilter::Uncategorized,
+        i => model
+            .categories()
+            .get((i as usize).saturating_sub(2))
+            .map(|item| CategoryFilter::Id(item.id.clone()))
+            .unwrap_or(CategoryFilter::All),
+    }
 }
 
 fn path_text(path: &Path) -> SharedString {

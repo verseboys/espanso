@@ -3,6 +3,7 @@ mod backup;
 mod inventory;
 mod location;
 mod matches;
+mod meta;
 mod migration;
 mod model;
 mod scaffold;
@@ -24,8 +25,12 @@ pub use location::{
     resolve_config_location, ConfigLocationStore, ConfigPathSource, ResolvedConfigLocation,
 };
 pub use matches::{MatchRepository, UiMatch, UiMatchRepository};
+pub use meta::{
+    create_category, document_from_matches, next_category_id, Category, MatchMeta, UiMetaDocument,
+    UiMetaStore,
+};
 pub use migration::{ConfigValidator, EspansoConfigValidator, MigrationPlan, MigrationService};
-pub use model::{ModelEffect, ModelMessage, SettingsModel, SettingsTab};
+pub use model::{CategoryFilter, ModelEffect, ModelMessage, SettingsModel, SettingsTab};
 pub use scaffold::{ConfigTemplates, ScaffoldPlan, ScaffoldService};
 pub use single_instance::SettingsInstanceGuard;
 
